@@ -1,53 +1,59 @@
-# scripts/analyze_activations.py (FINAL, INTEGRATED VERSION)
-# This script runs the model and performs gradient-based analysis in one go.
+# scripts/analyze_activations.py (FINAL, SELF-CONTAINED, MODERN VERSION)
 
 import argparse
 import os
 import torch
 import numpy as np
+import pandas as pd  # Using pandas to read the data
 from glob import glob
 from tqdm import tqdm
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
-from init_corpora import init_corpora
-from diagnnose.corpus import Corpus
 
 DEVICE = "cpu"
+
+# This global variable will store the gradient captured by our hook
+captured_grad = None
+
+
+def save_grad_hook(grad):
+    """A hook function that saves the gradient of a tensor."""
+    global captured_grad
+    captured_grad = grad
 
 
 def get_activations_and_calculate_effect(input_ids, target_start_idx):
     """
-    Runs the model with gradients enabled, gets the final hidden state,
-    and calculates the direct effect of each neuron.
+    Runs the model, captures intermediate gradients using a hook, and calculates the direct effect.
     """
-    # Ensure the model is in eval mode for consistent outputs, but keep gradients on.
     model.eval()
 
-    # Run the model. Gradients are enabled by default outside a no_grad context.
     outputs = model(input_ids, output_hidden_states=True)
+    final_hidden_state = outputs.hidden_states[-1]
 
-    # Get the final layer's hidden state. It's "live" and has a computation graph.
-    final_hidden_state = outputs.hidden_states[-1].squeeze(0)  # Remove batch dimension
+    hook_handle = final_hidden_state.register_hook(save_grad_hook)
 
-    # --- This is the same logic as before, but now it will work ---
-    logits = outputs.logits.squeeze(0)
+    logits = outputs.logits
     log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
 
-    target_token_ids = input_ids.squeeze(0)[target_start_idx:]
+    target_token_ids = input_ids[0, target_start_idx:]
 
     if len(target_token_ids) == 0:
+        hook_handle.remove()
         return np.zeros(model.config.n_embd)
 
-    target_log_probs = log_probs[target_start_idx - 1:-1].gather(1, target_token_ids.unsqueeze(-1)).sum()
+    target_log_probs = log_probs[0, target_start_idx - 1:-1].gather(1, target_token_ids.unsqueeze(-1)).sum()
 
-    # Zero out any previous gradients before the new backward pass.
     model.zero_grad()
     target_log_probs.backward()
 
-    # The gradient is now stored in the hidden state tensor itself.
-    # We access it via an internal attribute because it's not a leaf node.
-    hidden_state_grad = final_hidden_state.grad
+    hook_handle.remove()
 
-    direct_effects = final_hidden_state * hidden_state_grad
+    hidden_state_grad = captured_grad
+
+    if hidden_state_grad is None:
+        return np.zeros(model.config.n_embd)
+
+    direct_effects = final_hidden_state.squeeze(0) * hidden_state_grad.squeeze(0)
     neuron_effects = direct_effects.sum(dim=0)
 
     return neuron_effects.detach().cpu().numpy()
@@ -56,51 +62,51 @@ def get_activations_and_calculate_effect(input_ids, target_start_idx):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Find influential neurons using the Accumulative Direct Effect method.")
-    parser.add_argument("--model", type=str, required=True, help="Model name (e.g., gpt2-large).")
-    parser.add_argument("--data_dir", type=str, required=True, help="Directory containing the raw .csv corpus files.")
-    parser.add_argument("--output_file", type=str, required=True, help="Path to save the final neuron effect scores.")
+    parser.add_argument("--model", type=str, required=True)
+    parser.add_argument("--corpus_file", type=str, required=True,
+                        help="Path to a SINGLE PROCESSED .csv file from the 'new_corpora' folder.")
+    parser.add_argument("--output_file", type=str, required=True)
     args = parser.parse_args()
 
-    print(f"--- Starting Neuron Analysis for {args.data_dir} ---")
+    print(f"--- Starting Neuron Analysis for {os.path.basename(args.corpus_file)} ---")
     print("Loading model and tokenizer...")
     model = GPT2LMHeadModel.from_pretrained(args.model).to(DEVICE)
     tokenizer = GPT2Tokenizer.from_pretrained(args.model)
 
-    primed_corpora, COLUMNS = init_corpora(args.data_dir, tokenizer)
+    # Use pandas to read the processed corpus file
+    corpus_df = pd.read_csv(args.corpus_file)
 
     hidden_size = model.config.n_embd
     total_effect_px = np.zeros(hidden_size)
     total_effect_py = np.zeros(hidden_size)
 
-    # We only need to analyze the Active Target conditions
-    corpus_name_px = 'x_px'  # Active Target | Active Prime
-    corpus_name_py = 'x_py'  # Active Target | Passive Prime
+    # Define the columns we need from the CSV
+    col_tokens_px = 'x_px'
+    col_tokens_py = 'x_py'
+    col_start_idx_px = 'prime_x_start_idx'
+    col_start_idx_py = 'prime_y_start_idx'
 
-    for corpus_label, corpus_path in primed_corpora.items():
-        print(f"\nProcessing corpus: {corpus_label}")
+    for index, row in tqdm(corpus_df.iterrows(), total=len(corpus_df),
+                           desc=f"Analyzing {os.path.basename(args.corpus_file)}"):
+        # --- Congruent Condition ---
+        # The CSV contains the full sentence string with tokens separated by spaces
+        tokens_px = row[col_tokens_px].split(' ')
+        input_ids_px = torch.tensor([tokenizer.convert_tokens_to_ids(tokens_px)]).to(DEVICE)
+        start_idx_px = row[col_start_idx_px]
+        effect_px = get_activations_and_calculate_effect(input_ids_px, start_idx_px)
+        total_effect_px += effect_px
 
-        # Use the diagnnose Corpus loader to read the processed data
-        corpus = Corpus.create(path=corpus_path, header_from_first_line=True, tokenize_columns=list(COLUMNS.keys()),
-                               convert_numerical=True, sep=",")
-
-        for item in tqdm(corpus, desc=f"Analyzing {corpus_label}"):
-            # --- Congruent Condition ---
-            tokens_px = getattr(item, corpus_name_px)
-            input_ids_px = torch.tensor([tokenizer.convert_tokens_to_ids(tokens_px)]).to(DEVICE)
-            start_idx_px = getattr(item, COLUMNS[corpus_name_px])
-            effect_px = get_activations_and_calculate_effect(input_ids_px, start_idx_px)
-            total_effect_px += effect_px
-
-            # --- Incongruent Condition ---
-            tokens_py = getattr(item, corpus_name_py)
-            input_ids_py = torch.tensor([tokenizer.convert_tokens_to_ids(tokens_py)]).to(DEVICE)
-            start_idx_py = getattr(item, COLUMNS[corpus_name_py])
-            effect_py = get_activations_and_calculate_effect(input_ids_py, start_idx_py)
-            total_effect_py += effect_py
+        # --- Incongruent Condition ---
+        tokens_py = row[col_tokens_py].split(' ')
+        input_ids_py = torch.tensor([tokenizer.convert_tokens_to_ids(tokens_py)]).to(DEVICE)
+        start_idx_py = row[col_start_idx_py]
+        effect_py = get_activations_and_calculate_effect(input_ids_py, start_idx_py)
+        total_effect_py += effect_py
 
     priming_effect_per_neuron = total_effect_px - total_effect_py
 
     print("\n--- Analysis Complete ---")
+    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
     np.save(args.output_file, priming_effect_per_neuron)
     print(f"Neuron priming effect scores saved to: {args.output_file}")
 
