@@ -1,32 +1,28 @@
-# scripts/analyze_activations.py (FINAL, SELF-CONTAINED, MODERN VERSION)
+# scripts/analyze_activations.py (FINAL, GPU-ENABLED VERSION)
 
 import argparse
 import os
 import torch
 import numpy as np
-import pandas as pd  # Using pandas to read the data
-from glob import glob
+import pandas as pd
 from tqdm import tqdm
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
-DEVICE = "cpu"
+# This line correctly and automatically selects the GPU if available
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# This global variable will store the gradient captured by our hook
 captured_grad = None
 
 
 def save_grad_hook(grad):
-    """A hook function that saves the gradient of a tensor."""
     global captured_grad
     captured_grad = grad
 
 
 def get_activations_and_calculate_effect(input_ids, target_start_idx):
-    """
-    Runs the model, captures intermediate gradients using a hook, and calculates the direct effect.
-    """
     model.eval()
 
+    # The input_ids are already on the correct device from the main loop
     outputs = model(input_ids, output_hidden_states=True)
     final_hidden_state = outputs.hidden_states[-1]
 
@@ -63,24 +59,27 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Find influential neurons using the Accumulative Direct Effect method.")
     parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--corpus_file", type=str, required=True,
-                        help="Path to a SINGLE PROCESSED .csv file from the 'new_corpora' folder.")
+    parser.add_argument("--corpus_file", type=str, required=True)
     parser.add_argument("--output_file", type=str, required=True)
     args = parser.parse_args()
 
     print(f"--- Starting Neuron Analysis for {os.path.basename(args.corpus_file)} ---")
+    print(f"Using device: {DEVICE}")
+
+    if DEVICE == "cpu":
+        print("\nWARNING: CUDA not available. This script will be very slow on the CPU.")
+
     print("Loading model and tokenizer...")
+    # --- CHANGE 1: Move the model to the GPU right after loading ---
     model = GPT2LMHeadModel.from_pretrained(args.model).to(DEVICE)
     tokenizer = GPT2Tokenizer.from_pretrained(args.model)
 
-    # Use pandas to read the processed corpus file
     corpus_df = pd.read_csv(args.corpus_file)
 
     hidden_size = model.config.n_embd
     total_effect_px = np.zeros(hidden_size)
     total_effect_py = np.zeros(hidden_size)
 
-    # Define the columns we need from the CSV
     col_tokens_px = 'x_px'
     col_tokens_py = 'x_py'
     col_start_idx_px = 'prime_x_start_idx'
@@ -88,15 +87,13 @@ if __name__ == "__main__":
 
     for index, row in tqdm(corpus_df.iterrows(), total=len(corpus_df),
                            desc=f"Analyzing {os.path.basename(args.corpus_file)}"):
-        # --- Congruent Condition ---
-        # The CSV contains the full sentence string with tokens separated by spaces
+        # --- CHANGE 2: Move the data tensors to the GPU ---
         tokens_px = row[col_tokens_px].split(' ')
         input_ids_px = torch.tensor([tokenizer.convert_tokens_to_ids(tokens_px)]).to(DEVICE)
         start_idx_px = row[col_start_idx_px]
         effect_px = get_activations_and_calculate_effect(input_ids_px, start_idx_px)
         total_effect_px += effect_px
 
-        # --- Incongruent Condition ---
         tokens_py = row[col_tokens_py].split(' ')
         input_ids_py = torch.tensor([tokenizer.convert_tokens_to_ids(tokens_py)]).to(DEVICE)
         start_idx_py = row[col_start_idx_py]
