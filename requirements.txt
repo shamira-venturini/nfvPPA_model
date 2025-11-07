@@ -1,0 +1,16 @@
+# Core Data Science & Plotting
+pandas
+matplotlib
+seaborn
+scikit-learn
+
+# NLP & Model Handling
+torch
+torchvision
+transformers
+spacy
+
+# Notebook Environment
+jupyter
+ipython
+matplotlib-inline
