@@ -1,0 +1,29 @@
+# Python virtual environment
+venv/
+.venv/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Data and Results Folders - CRITICAL
+results/
+new_corpora/
+target_corpora/
+raw_activations\
+
+# Large data files and archives
+*.zip
+*.csv
+*.npy
+*.pt
+*.pickle
+*.png
