@@ -1,0 +1,6 @@
+{
+  "model": "gpt2-large",
+  "layer_idx": 12,
+  "method": "gradient_x_activation_balanced_2x2",
+  "samples": 10
+}
