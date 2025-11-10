@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-analyze_activations_gradient_final.py
--------------------------------------
-Computes per-neuron attribution using Gradient x Activation, specifically tailored
-to the priming data structure where columns represent a 2x2 (Prime x Target) design.
+analyze_subspace_pca_token_level_final_v2.py
+--------------------------------------------
+Finds the principal subspace at the main verb of the target sentence.
 
-Correctly calculates a balanced priming effect based on this structure.
+This version uses the correct logic to find the verb index based on the
+start_idx columns and the known structure of the BPE-tokenized target sentences.
 """
 
 import argparse
@@ -17,6 +17,7 @@ import pandas as pd
 from tqdm import tqdm
 import torch
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from sklearn.decomposition import PCA
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -26,103 +27,94 @@ def ensure_dir(d):
 
 
 def tokenize_row(tokenizer, text):
-    toks = text.strip().split()
-    ids = tokenizer.convert_tokens_to_ids(toks)
-    return torch.tensor([ids], dtype=torch.long).to(DEVICE)
+    # The tokenizer must be called directly to get the correct BPE tokens
+    # We also add the beginning of text token if the model expects it.
+    # For GPT-2, the <|endoftext|> is the BOS token.
+    return tokenizer(text, return_tensors='pt').input_ids.to(DEVICE)
 
 
-def compute_gradient_attribution(model, input_ids, layer_idx):
-    model.zero_grad()
-    target_tensor = None
+@torch.no_grad()
+def get_token_activation(model, input_ids, layer_idx, token_idx):
+    """Gets the hidden state for a given layer AT A SPECIFIC TOKEN INDEX."""
+    outputs = model(input_ids, output_hidden_states=True)
+    activations = outputs.hidden_states[layer_idx + 1].squeeze(0)
 
-    def hook_fn(module, inp, out):
-        nonlocal target_tensor
-        out.retain_grad()
-        target_tensor = out
-
-    handle = model.transformer.h[layer_idx].mlp.c_proj.register_forward_hook(hook_fn)
-
-    outputs = model(input_ids)
-    logits = outputs.logits
-    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-    token_ids = input_ids[0]
-
-    if token_ids.shape[0] <= 1:
-        handle.remove()
+    if token_idx >= activations.shape[0]:
+        print(f"Warning: token_idx {token_idx} is out of bounds for seq len {activations.shape[0]}.")
         return np.zeros(model.config.n_embd, dtype=np.float32)
 
-    target_log_prob = log_probs[0, :-1, :].gather(1, token_ids[1:].unsqueeze(-1)).sum()
-    target_log_prob.backward()
-    handle.remove()
-
-    if target_tensor is None or target_tensor.grad is None:
-        return np.zeros(model.config.n_embd, dtype=np.float32)
-
-    grad_x_activation = (target_tensor.grad * target_tensor).squeeze(0).sum(dim=0)
-    return grad_x_activation.detach().cpu().numpy()
+    token_activation = activations[token_idx]
+    return token_activation.cpu().numpy()
 
 
-# ==============================================================================
-# === SCRIPT LOGIC CORRECTED FOR YOUR SPECIFIC CSV STRUCTURE ===================
-# ==============================================================================
-def run_balanced_gradient_analysis(model, tokenizer, corpus_df, layer_idx, output_dir, sample_limit=None):
+def run_token_subspace_analysis(model, tokenizer, corpus_df, layer_idx, output_dir, sample_limit=None):
     ensure_dir(output_dir)
-    attribution_matrix = []
-    summary_data = []
 
     if sample_limit:
         corpus_df = corpus_df.head(sample_limit)
 
-    iterator = tqdm(corpus_df.iterrows(), total=len(corpus_df), desc=f"Layer {layer_idx} Gradient Attribution")
+    difference_vectors = []
+    iterator = tqdm(corpus_df.iterrows(), total=len(corpus_df), desc=f"Layer {layer_idx} Token-Level Subspace Analysis")
 
-    for idx, row in iterator:
-        # Tokenize all four conditions based on the 2x2 design
-        ids_act_prime_act_target = tokenize_row(tokenizer, row["x_px"])  # Congruent
-        ids_pas_prime_act_target = tokenize_row(tokenizer, row["x_py"])  # Incongruent
-        ids_act_prime_pas_target = tokenize_row(tokenizer, row["y_px"])  # Incongruent
-        ids_pas_prime_pas_target = tokenize_row(tokenizer, row["y_py"])  # Congruent
+    for _, row in iterator:
+        # --- LOGIC CORRECTED FOR BPE TOKENIZATION ---
 
-        # Calculate Gradient Attribution for all four sentences
-        attr_congruent_1 = compute_gradient_attribution(model, ids_act_prime_act_target, layer_idx)
-        attr_congruent_2 = compute_gradient_attribution(model, ids_pas_prime_pas_target, layer_idx)
-        attr_incongruent_1 = compute_gradient_attribution(model, ids_pas_prime_act_target, layer_idx)
-        attr_incongruent_2 = compute_gradient_attribution(model, ids_act_prime_pas_target, layer_idx)
+        # 1. Define the four conditions
+        text_congruent_1 = row["x_px"]  # Active Prime -> Active Target
+        text_congruent_2 = row["y_py"]  # Passive Prime -> Passive Target
+        text_incongruent_1 = row["x_py"]  # Passive Prime -> Active Target
+        text_incongruent_2 = row["y_px"]  # Active Prime -> Passive Target
 
-        # Average the attributions for the two congruent conditions
-        avg_attr_congruent = (attr_congruent_1 + attr_congruent_2) / 2.0
+        # 2. Calculate the correct verb indices based on BPE token structure
+        # For Active Targets ("A secretary smelled..."), the verb is the 3rd token of the target.
+        verb_idx_active_target = int(row['prime_x_start_idx']) + 2
 
-        # Average the attributions for the two incongruent conditions
-        avg_attr_incongruent = (attr_incongruent_1 + attr_incongruent_2) / 2.0
+        # For Passive Targets ("A machine was smelled..."), the verb is the 4th token of the target.
+        verb_idx_passive_target = int(row['prime_y_start_idx']) + 3
 
-        # The priming effect is the difference between congruent and incongruent processing
-        balanced_priming_attribution = avg_attr_congruent - avg_attr_incongruent
+        # 3. Get activations AT THE CORRECT VERB TOKEN for all four conditions
+        act_congruent_1 = get_token_activation(model, tokenize_row(tokenizer, text_congruent_1), layer_idx,
+                                               verb_idx_active_target)
+        act_congruent_2 = get_token_activation(model, tokenize_row(tokenizer, text_congruent_2), layer_idx,
+                                               verb_idx_passive_target)
+        act_incongruent_1 = get_token_activation(model, tokenize_row(tokenizer, text_incongruent_1), layer_idx,
+                                                 verb_idx_active_target)
+        act_incongruent_2 = get_token_activation(model, tokenize_row(tokenizer, text_incongruent_2), layer_idx,
+                                                 verb_idx_passive_target)
 
-        attribution_matrix.append(balanced_priming_attribution)
-        summary_data.append({
-            "index": idx,
-            "attribution_mean": balanced_priming_attribution.mean(),
-            "attribution_std": balanced_priming_attribution.std()
-        })
+        # 4. Calculate difference vectors
+        diff_active_target = act_congruent_1 - act_incongruent_1
+        difference_vectors.append(diff_active_target)
 
-    # --- The rest of the script remains the same ---
-    attribution_matrix = np.stack(attribution_matrix)
-    np.save(Path(output_dir) / "gradient_attribution_vectors.npy", attribution_matrix)
-    pd.DataFrame(summary_data).to_csv(Path(output_dir) / "gradient_attribution_summary.csv", index=False)
+        diff_passive_target = act_congruent_2 - act_incongruent_2
+        difference_vectors.append(diff_passive_target)
 
-    with open(Path(output_dir) / "metadata.json", "w") as f:
-        json.dump({
-            "model": model.name_or_path,
-            "layer_idx": layer_idx,
-            "method": "gradient_x_activation_balanced_2x2",
-            "samples": len(attribution_matrix)
-        }, f, indent=2)
+    # --- Perform PCA ---
+    X = np.stack(difference_vectors)
+    pca = PCA(n_components=10)
+    pca.fit(X)
+    pc1 = pca.components_[0]
 
-    print(f"\nSaved per-neuron Gradient Attributions: {attribution_matrix.shape} → {output_dir}")
-    print("Mean Attribution across dataset:", attribution_matrix.mean())
+    # --- Save and Analyze the Results ---
+    np.save(Path(output_dir) / "pca_components_token_level.npy", pca.components_)
+    np.save(Path(output_dir) / "pca_explained_variance_token_level.npy", pca.explained_variance_ratio_)
+
+    print(f"\n--- Token-Level Subspace Analysis Complete for Layer {layer_idx} ---")
+    print(f"Explained variance by PC1 (at the verb): {pca.explained_variance_ratio_[0] * 100:.2f}%")
+
+    top_neuron_indices = np.argsort(np.abs(pc1))[-20:][::-1]
+
+    print("\n--- Top 20 Neurons Contributing to the 'Verb Processing Subspace' (PC1) ---")
+    pc1_df = pd.DataFrame({
+        'Neuron Index': top_neuron_indices,
+        'Contribution to PC1': pc1[top_neuron_indices]
+    })
+    print(pc1_df.to_string(index=False))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Per-neuron Gradient Attribution (2x2 Balanced Design)")
+    parser = argparse.ArgumentParser(
+        description="Find grammar subspace at the token-level using PCA (Corrected for BPE).")
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--corpus_file", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
@@ -130,15 +122,17 @@ def main():
     parser.add_argument("--sample_limit", type=int, default=None)
     args = parser.parse_args()
 
-    print(f"--- Starting BALANCED Gradient-Based Analysis (2x2 Design) ---")
-    print(f"Using device: {DEVICE}")
-
     model = GPT2LMHeadModel.from_pretrained(args.model).to(DEVICE).eval()
     tokenizer = GPT2Tokenizer.from_pretrained(args.model)
     corpus_df = pd.read_csv(args.corpus_file)
 
-    run_balanced_gradient_analysis(model, tokenizer, corpus_df, args.layer_idx,
-                                   args.output_dir, sample_limit=args.sample_limit)
+    required_cols = ['x_px', 'x_py', 'y_px', 'y_py', 'prime_x_start_idx', 'prime_y_start_idx']
+    if not all(col in corpus_df.columns for col in required_cols):
+        print(f"❌ ERROR: Your CSV file is missing one of the required columns: {required_cols}")
+        return
+
+    run_token_subspace_analysis(model, tokenizer, corpus_df, args.layer_idx,
+                                args.output_dir, sample_limit=args.sample_limit)
 
 
 if __name__ == "__main__":
