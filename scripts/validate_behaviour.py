@@ -1,4 +1,4 @@
-# scripts/2.validate_behaviour.py (Version 3.0 - With POS Tagging)
+# scripts/validate_behaviour.py (Version 3.0 - With POS Tagging)
 
 import argparse
 import pandas as pd

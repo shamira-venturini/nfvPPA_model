@@ -128,7 +128,7 @@ def main():
 
     required_cols = ['x_px', 'x_py', 'y_px', 'y_py', 'prime_x_start_idx', 'prime_y_start_idx']
     if not all(col in corpus_df.columns for col in required_cols):
-        print(f"❌ ERROR: Your CSV file is missing one of the required columns: {required_cols}")
+        print(f" ERROR: Your CSV file is missing one of the required columns: {required_cols}")
         return
 
     run_token_subspace_analysis(model, tokenizer, corpus_df, args.layer_idx,
